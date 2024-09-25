@@ -1,0 +1,72 @@
+name: Docker Build and Security Scan
+on: [push, pull_request]
+permissions:
+  contents: read
+  security-events: write  # security-events 권한 추가
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          push: false
+          tags: myapp:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/myapp.tar
+
+      - name: Load image
+        run: |
+          docker load --input /tmp/myapp.tar
+          docker image ls -a
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'myapp:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3  # v2 -> v3로 업데이트
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Check for HIGH or CRITICAL vulnerabilities
+        id: check_vulnerabilities
+        run: |
+          if grep -q '"severity": "HIGH"\|"severity": "CRITICAL"' trivy-results.sarif; then
+            echo "vulnerabilities_found=true" >> $GITHUB_ENV
+            echo "::set-output name=vuln_found::true"
+          else
+            echo "vulnerabilities_found=false" >> $GITHUB_ENV
+            echo "::set-output name=vuln_found::false"
+          fi
+      - name: Prepare Slack message content
+        if: steps.check_vulnerabilities.outputs.vuln_found == 'true'
+        run: |
+          message="HIGH or CRITICAL vulnerabilities found in Docker image built from commit ${{ github.sha }}.\n\nTrivy Scan Results Summary:\n$(grep -C 5 '"severity": "HIGH"\|"severity": "CRITICAL"' trivy-results.sarif)"
+          echo "slack_message_content=${message}" >> $GITHUB_ENV
+      - name: Send Slack notification if vulnerabilities found
+        if: steps.check_vulnerabilities.outputs.vuln_found == 'true'
+        uses: slackapi/slack-github-action@v1
+        with:
+          slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "Docker Image Vulnerability Alert!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ env.slack_message_content }}"
+                  }
+                }
+              ]
+            }
